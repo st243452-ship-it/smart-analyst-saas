@@ -1,6 +1,5 @@
 import streamlit as st
 import google.generativeai as genai
-import PyPDF2 as pdf
 import json
 import os
 import time
@@ -9,9 +8,6 @@ from datetime import datetime
 # --- CONFIGURATION ---
 DATA_FILE = "user_data.json"
 FREE_LIMIT = 5
-# ⬇️ PASTE YOUR KEY HERE
-# Securely fetch key from cloud secrets
-SYSTEM_API_KEY = st.secrets["SYSTEM_API_KEY"]
 
 st.set_page_config(
     page_title="Gemini Pro Analyst",
@@ -47,39 +43,35 @@ def get_user_stats(email):
         return data[email]["credits_used"], data[email]["history"]
     return 0, []
 
-def extract_text(uploaded_file):
+# --- NEW: VISION ENGINE (Replaces PyPDF2) ---
+def upload_to_gemini(uploaded_file):
+    """Save uploaded file temporarily and send to Gemini Vision"""
     try:
-        reader = pdf.PdfReader(uploaded_file)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text()
-        return text
-    except:
+        # 1. Save to a temporary file on the server
+        with open("temp_doc.pdf", "wb") as f:
+            f.write(uploaded_file.getvalue())
+        
+        # 2. Upload to Google AI
+        vision_file = genai.upload_file("temp_doc.pdf")
+        return vision_file
+    except Exception as e:
+        st.error(f"Upload failed: {e}")
         return None
 
-# --- IMPROVED RETRY LOGIC ---
-def ask_gemini_with_retry(model, prompt):
-    # Try 3 times, waiting longer each time (10s, 20s, 30s)
-    wait_times = [10, 20, 30] 
-    
-    for i, wait_seconds in enumerate(wait_times):
+def ask_gemini_vision(model, vision_file, question):
+    """Send the file object + question to Gemini"""
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            return model.generate_content(prompt).text
+            # We pass the FILE directly, not just text!
+            response = model.generate_content([question, vision_file])
+            return response.text
         except Exception as e:
             if "429" in str(e):
-                # Show a progress bar so user knows we are waiting
-                progress_text = f"🚦 High traffic (Free Tier). Retrying in {wait_seconds} seconds..."
-                my_bar = st.progress(0, text=progress_text)
-                
-                for percent_complete in range(100):
-                    time.sleep(wait_seconds / 100)
-                    my_bar.progress(percent_complete + 1, text=progress_text)
-                
-                my_bar.empty() # Remove bar after waiting
+                time.sleep(10)
             else:
-                return f"⚠️ Technical Error: {str(e)}"
-    
-    return "❌ System is extremely busy. Please wait 2 minutes before asking again."
+                return f"Error: {e}"
+    return "System busy. Please try again."
 
 # --- SESSION STATE ---
 if "logged_in" not in st.session_state:
@@ -88,6 +80,8 @@ if "user_email" not in st.session_state:
     st.session_state.user_email = ""
 if "current_chat" not in st.session_state:
     st.session_state.current_chat = []
+if "uploaded_file_ref" not in st.session_state:
+    st.session_state.uploaded_file_ref = None
 
 # --- PAGE 1: LOGIN ---
 if not st.session_state.logged_in:
@@ -112,75 +106,75 @@ else:
     with st.sidebar:
         st.markdown("### 👤 User Profile")
         st.caption(f"Logged in as: {st.session_state.user_email}")
-        
         st.markdown("---")
         st.write(f"**Credits:** {credits_used}/{FREE_LIMIT}")
         st.progress(min(credits_used / FREE_LIMIT, 1.0))
         
         st.markdown("### 📜 Your History")
-        if not history:
-            st.caption("No history yet.")
-        else:
+        if history:
             for item in reversed(history[-5:]): 
                 with st.expander(f"🕒 {item['time'].split(' ')[1]} - {item['doc'][:10]}..."):
                     st.write(f"**Q:** {item['q']}")
                     st.info(f"**A:** {item['a'][:150]}...")
         
-        st.markdown("<div style='height: 50vh;'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height: 30vh;'></div>", unsafe_allow_html=True)
         st.markdown("---")
         if st.button("🚪 Log Out"):
             st.session_state.logged_in = False
             st.rerun()
 
     # --- MAIN AREA ---
-    st.title("✨ Document Intelligence Hub")
-    uploaded_file = st.file_uploader("Upload PDF Document", type="pdf")
+    st.title("✨ Document Vision Hub")
+    st.caption("Supports: PDFs, Scanned Docs, Charts, Receipts")
+    
+    uploaded_file = st.file_uploader("Upload Document", type="pdf")
 
     if uploaded_file:
-        text_content = extract_text(uploaded_file)
-        
-        if text_content:
-            # Display Chat History
-            for msg in st.session_state.current_chat:
-                icon = "👤" if msg["role"] == "user" else "✨"
-                with st.chat_message(msg["role"], avatar=icon):
-                    st.markdown(msg["content"])
-
-            # Input Area
-            if credits_left > 0:
-                if user_question := st.chat_input("Ask a question about this document..."):
+        # --- VISION LOADING LOGIC ---
+        # We only upload to Google ONCE per file to save time
+        if st.session_state.uploaded_file_ref is None:
+            with st.spinner("🧠 Reading document structure (Vision AI)..."):
+                # Fetch Key securely
+                if "SYSTEM_API_KEY" in st.secrets:
+                    genai.configure(api_key=st.secrets["SYSTEM_API_KEY"])
                     
-                    # User Message
-                    st.session_state.current_chat.append({"role": "user", "content": user_question})
-                    with st.chat_message("user", avatar="👤"):
-                        st.markdown(user_question)
+                    # Upload file to Gemini
+                    vision_ref = upload_to_gemini(uploaded_file)
+                    st.session_state.uploaded_file_ref = vision_ref
+                    st.success("Document analyzed! You can now ask questions about charts, images, or text.")
+                else:
+                    st.error("🚨 Cloud API Key missing! Check your Secrets settings.")
 
-                    # AI Response
-                    if SYSTEM_API_KEY == "PASTE_YOUR_KEY_HERE":
-                        st.error("🚨 Developer Error: API Key is missing in code (Line 16).")
-                    else:
-                        with st.chat_message("assistant", avatar="✨"):
-                            with st.spinner("Analyzing..."):
-                                try:
-                                    genai.configure(api_key=SYSTEM_API_KEY)
-                                    model = genai.GenerativeModel('gemini-flash-latest')
-                                    prompt = f"Document: {text_content}\nQuestion: {user_question}\nAnswer:"
-                                    
-                                    # Call the Improved Retry Function
-                                    bot_reply = ask_gemini_with_retry(model, prompt)
-                                    
-                                    st.markdown(bot_reply)
-                                    
-                                    # Save only if successful
-                                    if "Technical Error" not in bot_reply and "System is extremely busy" not in bot_reply:
-                                        st.session_state.current_chat.append({"role": "assistant", "content": bot_reply})
-                                        save_chat_history(st.session_state.user_email, uploaded_file.name, user_question, bot_reply)
-                                        time.sleep(0.5)
-                                        st.rerun()
-                                except Exception as e:
-                                    st.error(f"Error: {e}")
+        # --- CHAT INTERFACE ---
+        # Display Chat History
+        for msg in st.session_state.current_chat:
+            icon = "👤" if msg["role"] == "user" else "✨"
+            with st.chat_message(msg["role"], avatar=icon):
+                st.markdown(msg["content"])
 
-            else:
-                st.warning("🔒 Free limit reached.")
-                st.info("Check the sidebar to see your past answers.")
-                st.button("Upgrade to Pro")
+        # Chat Input
+        if credits_left > 0:
+            if user_question := st.chat_input("Ask about this document..."):
+                
+                st.session_state.current_chat.append({"role": "user", "content": user_question})
+                with st.chat_message("user", avatar="👤"):
+                    st.markdown(user_question)
+
+                with st.chat_message("assistant", avatar="✨"):
+                    with st.spinner("Looking at document..."):
+                        # Use the Vision Engine
+                        model = genai.GenerativeModel('gemini-flash-latest')
+                        
+                        bot_reply = ask_gemini_vision(model, st.session_state.uploaded_file_ref, user_question)
+                        
+                        st.markdown(bot_reply)
+                        
+                        # Save History
+                        if "System busy" not in bot_reply:
+                            st.session_state.current_chat.append({"role": "assistant", "content": bot_reply})
+                            save_chat_history(st.session_state.user_email, uploaded_file.name, user_question, bot_reply)
+                            time.sleep(0.5)
+                            st.rerun()
+        else:
+            st.warning("🔒 Credit limit reached.")
+            st.button("Upgrade to Pro")
