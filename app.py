@@ -43,15 +43,11 @@ def get_user_stats(email):
         return data[email]["credits_used"], data[email]["history"]
     return 0, []
 
-# --- NEW: VISION ENGINE (Replaces PyPDF2) ---
+# --- NEW: VISION ENGINE ---
 def upload_to_gemini(uploaded_file):
-    """Save uploaded file temporarily and send to Gemini Vision"""
     try:
-        # 1. Save to a temporary file on the server
         with open("temp_doc.pdf", "wb") as f:
             f.write(uploaded_file.getvalue())
-        
-        # 2. Upload to Google AI
         vision_file = genai.upload_file("temp_doc.pdf")
         return vision_file
     except Exception as e:
@@ -59,11 +55,9 @@ def upload_to_gemini(uploaded_file):
         return None
 
 def ask_gemini_vision(model, vision_file, question):
-    """Send the file object + question to Gemini"""
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # We pass the FILE directly, not just text!
             response = model.generate_content([question, vision_file])
             return response.text
         except Exception as e:
@@ -102,20 +96,12 @@ else:
     credits_used, history = get_user_stats(st.session_state.user_email)
     credits_left = FREE_LIMIT - credits_used
     
-    # --- SIDEBAR ---
     with st.sidebar:
         st.markdown("### 👤 User Profile")
         st.caption(f"Logged in as: {st.session_state.user_email}")
         st.markdown("---")
         st.write(f"**Credits:** {credits_used}/{FREE_LIMIT}")
         st.progress(min(credits_used / FREE_LIMIT, 1.0))
-        
-        st.markdown("### 📜 Your History")
-        if history:
-            for item in reversed(history[-5:]): 
-                with st.expander(f"🕒 {item['time'].split(' ')[1]} - {item['doc'][:10]}..."):
-                    st.write(f"**Q:** {item['q']}")
-                    st.info(f"**A:** {item['a'][:150]}...")
         
         st.markdown("<div style='height: 30vh;'></div>", unsafe_allow_html=True)
         st.markdown("---")
@@ -130,46 +116,33 @@ else:
     uploaded_file = st.file_uploader("Upload Document", type="pdf")
 
     if uploaded_file:
-        # --- VISION LOADING LOGIC ---
-        # We only upload to Google ONCE per file to save time
         if st.session_state.uploaded_file_ref is None:
             with st.spinner("🧠 Reading document structure (Vision AI)..."):
-                # Fetch Key securely
                 if "SYSTEM_API_KEY" in st.secrets:
                     genai.configure(api_key=st.secrets["SYSTEM_API_KEY"])
-                    
-                    # Upload file to Gemini
                     vision_ref = upload_to_gemini(uploaded_file)
                     st.session_state.uploaded_file_ref = vision_ref
-                    st.success("Document analyzed! You can now ask questions about charts, images, or text.")
+                    st.success("Document analyzed!")
                 else:
-                    st.error("🚨 Cloud API Key missing! Check your Secrets settings.")
+                    st.error("🚨 Cloud API Key missing!")
 
-        # --- CHAT INTERFACE ---
-        # Display Chat History
         for msg in st.session_state.current_chat:
             icon = "👤" if msg["role"] == "user" else "✨"
             with st.chat_message(msg["role"], avatar=icon):
                 st.markdown(msg["content"])
 
-        # Chat Input
         if credits_left > 0:
             if user_question := st.chat_input("Ask about this document..."):
-                
                 st.session_state.current_chat.append({"role": "user", "content": user_question})
                 with st.chat_message("user", avatar="👤"):
                     st.markdown(user_question)
 
                 with st.chat_message("assistant", avatar="✨"):
                     with st.spinner("Looking at document..."):
-                        # Use the Vision Engine
                         model = genai.GenerativeModel('gemini-flash-latest')
-                        
                         bot_reply = ask_gemini_vision(model, st.session_state.uploaded_file_ref, user_question)
-                        
                         st.markdown(bot_reply)
                         
-                        # Save History
                         if "System busy" not in bot_reply:
                             st.session_state.current_chat.append({"role": "assistant", "content": bot_reply})
                             save_chat_history(st.session_state.user_email, uploaded_file.name, user_question, bot_reply)
